@@ -1,54 +1,30 @@
 import glob
-from enum import Enum
+import os
 
 import cv2 as cv
 import numpy as np
 
 
-class ContourInfo:
-    def __init__(self, contour):
-        self.contour = contour
-        self.area = cv.contourArea(contour)
-        self.arc = cv.arcLength(contour, True) * 0.02
-        self.approx = cv.approxPolyDP(contour, self.arc, False)
-        self.corners = len(self.approx)
-        self.bounding_rect = cv.boundingRect(contour)
+class Contour:
+    def __init__(self, raw=None):
+        self.raw = None
+        if raw is not None:
+            self.contour = raw
+            self.hull = cv.convexHull(raw)
+            self.area = cv.contourArea(raw)
+        else:
+            self.area = 0
 
-    def area_covered(self):
-        x, y, box_width, box_height = self.bounding_rect
-        bounding_box_area = box_width * box_height
-        contour_area = self.area
-        percentage = contour_area / bounding_box_area
-        return int(percentage * 100)
+    def better_than(self, other):
+        return self.area > 0 and self.area > other.area
 
 
-def draw_contours(contours: list, output):
-    # loop over the contours
-    for contour in contours:
-        x, y, w, h = contour.bounding_rect
-        color = (255 - contour.area * w % 255, 255 - contour.area * h * w % 255, 255 - contour.area * x % 255)
-        cv.drawContours(output, [contour.contour], -1, color, 5)
-        cv.rectangle(output, (x, y), (x + w, y + h), color, 2)
-    pass
-
-
-def draw_corners(corners, image):
-    if corners is not None:
-        for i in corners:
-            x, y = i.ravel()
-            cv.circle(image, (int(x), int(y)), 3, (0, 0, 255), 15)
-
-
-def stop_execution():
-    key = cv.waitKey(1)
-    converted_key = key & 0xFF
-    return converted_key == ord('q')
-
-
-def next_frame():
-    key = cv.waitKey(1)
-    converted_key = key & 0xFF
-    return converted_key == ord('e')
+def to_cv_value(gimpH, gimpS, gimpV):
+    opencvH = gimpH / 2
+    opencvS = (gimpS / 100) * 255
+    opencvV = (gimpV / 100) * 255
+    print(f"[{gimpH} {gimpS} {gimpV}] to [{opencvH} {opencvS} {opencvV}]")
+    return [opencvH, opencvS, opencvV]
 
 
 def change_brightness(image, value=30):
@@ -61,289 +37,216 @@ def change_brightness(image, value=30):
     return cv.cvtColor(final_hsv, cv.COLOR_HSV2BGR)
 
 
-def add_text(image, text, pos):
-    cv.putText(image, text, pos, fontScale=1, fontFace=cv.FONT_HERSHEY_PLAIN, color=255)
+def show_image(title, image, pos=0):
+    title = "{} {}".format(title, pos)
+    cv.imshow(title, image)
+    cv.namedWindow(title, cv.WINDOW_NORMAL)
+    cv.moveWindow(title, 0, 250 * pos)
 
 
-def show_image(window, image):
-    cv.imshow(window, image)
-
-
-class ProcessModes(Enum):
-    MODE_CANNY = 1
-    MODE_MORPH = 2
-    MODE_THRESHOLD = 3
-    MODE_MASK = 4
+def load_image(path):
+    image = cv.imread(path)
+    height, width, _ = image.shape
+    image = cv.resize(image, [int(width * 0.4), int(height * 0.4)])
+    return image
 
 
 class EdgeDetector:
 
-    def __init__(self, mode=ProcessModes.MODE_CANNY):
-        self.settings_window = "Settings"
-        self.process_mode = mode
-        self.hsv_sensitivity = 15
-        self.noise_kernel_size = 3
+    def __init__(self, images):
+        self.images = images
+        self.threshold = 230
+        self.k_size = 5
+        self.blur_kernel_size = 7
+        self.erode_kernel_size = self.k_size
+        self.canny_upper = 255
+        self.canny_lower = 20
+        self.b = 0
+        self.g = 0
+        self.r = 255
+        # 0, 0, 77
+        self.h = 40
+        self.s = 0
+        self.v = 70
+        # 360, 28, 100
+        self.h_u = 360
+        self.s_u = 46
+        self.v_u = 100
         self.brightness = 30
-        self.max_thresh_value = 255
-        self.thresh_value = 85
-        self.min_dist = 50
-        self.features_quality = 0.01
-        self.features_max_corners = 25
-        self.features_corners_distance = 50
-        self.canny_lower = 50
-        self.canny_upper = 150
-        self.screen_width = 640
-        self.screen_height = 480
-        self.source_images = None
-        self.source_videos = None
-        self.source_use_camera = False
-        self.mode_switcher = {
-            ProcessModes.MODE_CANNY: self.attempt_with_canny,
-            ProcessModes.MODE_MORPH: self.attempt_with_morph,
-            ProcessModes.MODE_THRESHOLD: self.attempt_with_threshold,
-            ProcessModes.MODE_MASK: self.attempt_with_mask
-        }
-        # Flip it
-        # cv.flip(frame, +1, dst=frame)
-        # if self.record:
-        #     self.video_name = session_name + ".mp4"
-        #     self.four2c = cv.VideoWriter_fourcc(*'mp4v')
-        #     self.out = cv.VideoWriter(self.video_name, self.four2c, 20.0, (self.screen_width, self.screen_height))
+        self.last_brightness = self.brightness
 
-    def images(self, images=None):
-        self.source_images = images
+        self.display_settings()
+        os.system('''/usr/bin/osascript -e 'tell app "Finder" to set frontmost of process "Python" to true' ''')
 
-    def videos(self, videos=None):
-        self.source_videos = videos
+        pass
 
-    def use_camera(self, use_camera=True):
-        self.source_use_camera = use_camera
+    def display_settings(self):
+        self.settings_win = "settings"
+        cv.namedWindow(self.settings_win, cv.WINDOW_FREERATIO)
+        # cv.createTrackbar("threshold", self.settings_win, self.threshold, 255, self.update_threshold)
+        # cv.createTrackbar("b", self.settings_win, self.b, 255, self.update_b)
+        # cv.createTrackbar("g", self.settings_win, self.g, 255, self.update_g)
+        # cv.createTrackbar("r", self.settings_win, self.r, 255, self.update_r)
+        cv.createTrackbar("h l", self.settings_win, self.h, 360, self.update_h_l)
+        cv.createTrackbar("s l", self.settings_win, self.s, 100, self.update_s_l)
+        cv.createTrackbar("v l", self.settings_win, self.v, 100, self.update_v_l)
+        cv.createTrackbar("h u", self.settings_win, self.h_u, 360, self.update_h_u)
+        cv.createTrackbar("s u", self.settings_win, self.s_u, 100, self.update_s_u)
+        cv.createTrackbar("v u", self.settings_win, self.v_u, 100, self.update_v_u)
+        cv.createTrackbar("brightness", self.settings_win, self.brightness, 100, self.update_brightness)
+        # cv.createTrackbar("canny lower", self.settings_win, self.canny_lower, 255, self.update_canny_lower)
+        # cv.createTrackbar("canny upper", self.settings_win, self.canny_upper, 255, self.update_canny_upper)
+        # cv.createTrackbar("blur k size", self.settings_win, self.blur_kernel_size, 255, self.update_blur_k_size)
+        cv.moveWindow(self.settings_win, 50, 50)
+        cv.resizeWindow(self.settings_win, 600, 0)
+        # cv.createTrackbar("erode k size", self.settings_win, self.erode_kernel_size, 255, self.update_erode_k_size)
+
+    def update_brightness(self, b):
+        self.brightness = b
+
+    def update_threshold(self, threshold):
+        self.threshold = threshold
+
+    def update_blur_k_size(self, k_size):
+        if k_size % 2 == 1:
+            self.blur_kernel_size = k_size
+
+    def update_erode_k_size(self, k_size):
+        self.erode_kernel_size = k_size
+
+    def update_canny_lower(self, canny):
+        self.canny_lower = canny
+
+    def update_canny_upper(self, canny):
+        self.canny_upper = canny
+
+    def update_b(self, b):
+        self.b = b
+
+    def update_g(self, g):
+        self.g = g
+
+    def update_r(self, r):
+        self.r = r
+
+    def update_h_l(self, h):
+        self.h = h
+
+    def update_s_l(self, s):
+        self.s = s
+
+    def update_v_l(self, v):
+        self.v = v
+
+    def update_h_u(self, h):
+        self.h_u = h
+
+    def update_s_u(self, s):
+        self.s_u = s
+
+    def update_v_u(self, v):
+        self.v_u = v
 
     def run(self):
-        should_run = True
-        self.show_settings()
-        if self.source_images:
-            while should_run:
-                for image in self.source_images:
-                    frame = cv.imread(image)
-                    frame = cv.resize(frame, None, fx=0.1, fy=0.1)
-                    while should_run:
-                        result, processed = self.find_edges(frame)
-                        show_image("Processed", processed)
-                        show_image("Result", result)
+        for image_path in self.images:
+            print(image_path)
+            image = load_image(image_path)
 
-                        height, width = frame.shape[:2]
-                        cv.moveWindow("Result", 20, 100)
-                        cv.moveWindow("Processed", 40 + width, 100)
-                        if next_frame():
-                            break
-                        elif stop_execution():
-                            should_run = False
-                            cv.destroyAllWindows()
-                            break
-
-        elif self.source_use_camera:
-            video = cv.VideoCapture(0)
-            video.set(3, self.screen_width)
-            video.set(4, self.screen_height)
-            while video.isOpened():
-                success, frame = video.read()
-
-                result, processed = self.find_edges(frame)
-
-                cv.flip(result, 1, dst=result)
-                cv.flip(processed, 1, dst=processed)
-
-                show_image("Processed", processed)
-                show_image("Result", result)
-
-                height, width = frame.shape[:2]
-                cv.moveWindow("Result", 20, 100)
-                cv.moveWindow("Processed", 40 + width, 100)
-                if stop_execution():
+            lab = cv.cvtColor(image, cv.COLOR_BGR2Lab)
+            show_image("lab", lab)
+            while 1:
+                k = cv.waitKey(5) & 0xFF
+                if k == 27:
                     cv.destroyAllWindows()
+                    exit(1)
+                elif k == 32:
                     break
+                pass
 
-    def find_edges(self, frame):
-        frame_copy = frame.copy()
-        # Read frame
-        result = self.prepare_frame(frame_copy)
-        # find corners and contours
-        corners = self.get_features(result)
-        contours = self.get_contours(result)
+    # paper sticks out through applying mask by defining HSV colors
+    # best so far
+    def mask_out_paper(self, image):
+        brighter = change_brightness(image, self.brightness)
+        hsv = cv.cvtColor(brighter, cv.COLOR_BGR2HSV)
 
-        # lines = self.get_lines(result)
-        # if lines is not None:
-        #     for i in range(0, len(lines)):
-        #         line = lines[i][0]
-        #         cv.line(frame, (line[0], line[1]), (line[2], line[3]), (200, 255, 100), 13)
+        while 1:
+            if self.brightness != self.last_brightness:
+                print("brightness change")
+                brighter = change_brightness(image, self.brightness)
+                hsv = cv.cvtColor(brighter, cv.COLOR_BGR2HSV)
+                self.last_brightness = self.brightness
 
-        draw_contours(contours, frame_copy)
-        draw_corners(corners, frame_copy)
-        return frame_copy, result
+            mask = self.hsv_mask(hsv)
+            bitwise = cv.bitwise_and(image, image, mask=mask)
+            # canny = cv.Canny(bitwise, self.canny_lower, self.canny_upper)
+            # contour = self.find_contours(canny)
+            #
+            # if contour.area > 0:
+            #     cv.drawContours(image, [contour.contour], -1, (70, 255, 154), thickness=2)
+            #     cv.drawContours(image, [contour.hull], -1, (255, 70, 155), thickness=2)
 
-    def get_features(self, frame):
-        corners = cv.goodFeaturesToTrack(frame, self.features_max_corners, self.features_quality,
-                                         self.features_corners_distance)
-        return corners
+            show_image("results", image)
+            show_image("mask", mask, 1)
+            show_image("bitwise", bitwise, 2)
+            show_image("hsv", hsv, 3)
+            k = cv.waitKey(5) & 0xFF
+            if k == 27:
+                cv.destroyAllWindows()
+                exit(1)
+            elif k == 32:
+                break
+            pass
 
-    def get_contours(self, output):
-        contours, hierarchy = cv.findContours(output, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE)
-        parsed_contours = []
-        for contour in contours:
-            parsed_contours.append(ContourInfo(contour))
+    def hsv_mask(self, hsv):
+        lower_white = np.array(to_cv_value(self.h, self.s, self.v))
+        upper_white = np.array(to_cv_value(self.h_u, self.s_u, self.v_u))
+        mask = cv.inRange(hsv, lower_white, upper_white)
+        return mask
 
-        result_contours = sorted(parsed_contours, key=ContourInfo.area_covered, reverse=True)[:5]
+    def original_mask(self, image):
+        lower_white = np.array([self.b, self.g, self.r])
+        upper_white = np.array([255, 255, 255])
+        mask = cv.inRange(image, lower_white, upper_white)
+        return mask
 
-        return result_contours
+    def bitwise_mask(self, frame, hsv):
+        lower_white = np.array([self.b, self.g, self.r], dtype="uint8")
+        upper_white = np.array([255, 255, 255], dtype="uint8")
+        mask = cv.inRange(frame, lower_white, upper_white)
+        res = cv.bitwise_and(frame, frame, mask=mask)
+        return res
 
-    def get_lines(self, frame):
-        return cv.HoughLinesP(frame, 1, np.pi / 180, 50, None, 5, 10)
+    def contours(self, image):
+        image = cv.medianBlur(image, self.blur_kernel_size)
+        th, image = cv.threshold(image, self.threshold, 255, cv.THRESH_TRUNC)
+        image = cv.Canny(image, self.canny_upper, self.canny_lower)
 
-    def prepare_frame(self, frame):
-        frame = change_brightness(frame, self.brightness)
-        process_function = self.mode_switcher.get(self.process_mode, "Null")
-        return process_function(frame)
+        # kernel = cv.getStructuringElement(cv.MORPH_RECT, [self.erode_kernel_size, self.erode_kernel_size])
+        # image = cv.dilate(threshed, kernel)
+        # image = cv.erode(image, kernel)
 
-    def attempt_with_canny(self, frame):
-        frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-        frame = cv.GaussianBlur(frame, (self.noise_kernel_size, self.noise_kernel_size), 0)
-        frame = cv.erode(frame, None, iterations=2)
-        frame = cv.dilate(frame, None, iterations=2)
-        frame = cv.Canny(frame, self.canny_lower, self.canny_upper)
-        return frame
+        show_image("image", image, 1)
 
-    def attempt_with_morph(self, frame):
-        frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-        frame = cv.Canny(frame, self.canny_lower, self.canny_upper)
-        frame = cv.GaussianBlur(frame, (self.noise_kernel_size, self.noise_kernel_size), 10, sigmaY=10)
-        frame = cv.morphologyEx(frame, cv.MORPH_CLOSE, (self.noise_kernel_size, self.noise_kernel_size))
-        return frame
+    def hsv_threshold(self, hsv):
+        h, s, v = cv.split(hsv)
+        for i, channel in enumerate([h, s, v]):
+            th, threshed = cv.threshold(channel, self.threshold, 255, cv.THRESH_BINARY_INV)
+            show_image("threshed", threshed, i)
 
-    def attempt_with_threshold(self, frame):
-        frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-        val, frame = cv.threshold(frame, self.thresh_value, self.max_thresh_value, cv.THRESH_BINARY)
-        return frame
-
-    def attempt_with_mask(self, frame):
-        frame = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-        frame = cv.GaussianBlur(frame, (self.noise_kernel_size, self.noise_kernel_size), 0)
-        sensitivity = self.hsv_sensitivity
-        lower_white = np.array([0, 0, 255 - sensitivity])
-        upper_white = np.array([255, sensitivity, 255])
-        frame = cv.inRange(frame, lower_white, upper_white)
-        frame = cv.erode(frame, None, iterations=2)
-        frame = cv.dilate(frame, None, iterations=2)
-        return frame
-
-    def show_settings(self):
-        cv.namedWindow(self.settings_window)
-        settings_switcher = {
-            ProcessModes.MODE_CANNY: self.settings_canny,
-            ProcessModes.MODE_MORPH: self.settings_morph,
-            ProcessModes.MODE_THRESHOLD: self.settings_threshold,
-            ProcessModes.MODE_MASK: self.settings_mask
-        }
-        settings_switcher.get(self.process_mode)()
-        cv.createTrackbar("Features quality", self.settings_window, int(self.features_quality * 100), 10,
-                          self.set_features_quality)
-        cv.createTrackbar("Features max corners", self.settings_window, self.features_max_corners, 200,
-                          self.set_features_max_corners)
-        cv.createTrackbar("Features corners dist", self.settings_window, self.features_corners_distance, 1000,
-                          self.set_max_corners_distance)
-        cv.createTrackbar("Brightness", self.settings_window, self.brightness + 50, 100, self.set_brightness)
-        cv.createTrackbar("Noise kernel", self.settings_window, self.noise_kernel_size, 10, self.set_noise_kernel_size)
-
-        cv.moveWindow(self.settings_window, 40 + 2 * self.screen_width, 100)
-
-    def settings_canny(self):
-        cv.createTrackbar("Canny upper", self.settings_window, self.canny_upper, 255, self.set_canny_upper)
-        cv.createTrackbar("Canny lower", self.settings_window, self.canny_lower, 255, self.set_canny_lower)
-
-    def settings_morph(self):
+    def find_contours(self, image):
+        image = cv.Canny(image, self.canny_lower, self.canny_upper)
+        contours, hierarchy = cv.findContours(image, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        max_contour = Contour()
+        for raw_contour in contours:
+            new_contour = Contour(raw_contour)
+            if new_contour.better_than(max_contour):
+                max_contour = new_contour
+            pass
         pass
-
-    def settings_threshold(self):
-        cv.createTrackbar("Threshold value", self.settings_window, self.thresh_value, 255, self.set_thresh_value)
-
-    def settings_mask(self):
-        cv.createTrackbar("HSV sensitivity", self.settings_window, self.hsv_sensitivity, 255, self.set_hsv_sensitivity)
-
-    def set_thresh_value(self, value):
-        self.thresh_value = value
-
-    def set_max_thresh_value(self, value):
-        self.max_thresh_value = value
-
-    def set_features_max_corners(self, value):
-        self.features_max_corners = value
-
-    def set_features_quality(self, value):
-        self.features_quality = (int(value) / 100) + 0.01
-
-    def set_brightness(self, value):
-        self.brightness = value - 50
-
-    def set_noise_kernel_size(self, value):
-        if value % 2 == 0:
-            value = value + 1
-        self.noise_kernel_size = value
-
-    def set_max_corners_distance(self, value):
-        self.features_corners_distance = value
-
-    def set_canny_lower(self, value):
-        self.canny_lower = value
-
-    def set_canny_upper(self, value):
-        self.canny_upper = value
-
-    def set_hsv_sensitivity(self, value):
-        self.hsv_sensitivity = value
-
-    def is_paper_present(self, path):
-        original = cv.imread(path)
-        resized = cv.resize(original, None, fx=0.1, fy=0.1)
-        prepared = self.prepare_frame(resized)
-        contours = self.get_contours(prepared)
-        lines = self.get_lines(prepared)
-        if lines is not None:
-            for i in range(0, len(lines)):
-                line = lines[i][0]
-                cv.line(resized, (line[0], line[1]), (line[2], line[3]), (200, 255, 100), 13)
-        is_present = PaperDetection(False, "Not present: Unknown reason")
-        if len(contours):
-            biggest = contours[0]
-            draw_contours([biggest], resized)
-            show_image("present", resized)
-            cv.waitKey()
-            # print(biggest.area_covered())
-            if biggest.area_covered() > 55:
-                is_present = PaperDetection(True, "Paper found on screen.")
-            else:
-                # contour area too small
-                is_present = PaperDetection(False, "Not present: Not enough paper visible")
-        else:
-            # no contours found in frame
-            is_present = PaperDetection(False, "Not present: No paper present in image")
-        return is_present
-        pass
-
-
-class PaperDetection:
-    def __init__(self, is_present, reason):
-        self.is_present = is_present
-        self.reason = reason
+        return max_contour
 
 
 if __name__ == '__main__':
-    images_paths = glob.glob('resources/images/*')
-    detector = EdgeDetector(mode=ProcessModes.MODE_CANNY)
-    # detector.images(images_paths)
-    detector.use_camera()
+    images_paths = glob.glob('/Users/marko/Testing/3dfoot/success/*')
+    detector = EdgeDetector(images_paths)
     detector.run()
-
-    # image = images_paths[0]
-    # result = detector.is_paper_present(image)
-    # print(result.is_present)
-    # print(result.reason)
